@@ -11,10 +11,11 @@ import type { ProcessedFile } from './file/fileTypes.js';
 import { getGitDiffs } from './git/gitDiffHandle.js';
 import { getGitLogs } from './git/gitLogHandle.js';
 import { calculateMetrics, createMetricsTaskRunner } from './metrics/calculateMetrics.js';
+import { sortOutputFiles } from './output/outputSort.js';
 import { produceOutput } from './packager/produceOutput.js';
 import type { SuspiciousFileResult } from './security/securityCheck.js';
 import { validateFileSafety } from './security/validateFileSafety.js';
-import { packSkill } from './skill/packSkill.js';
+import type { PackSkillParams } from './skill/packSkill.js';
 
 export interface PackResult {
   totalFiles: number;
@@ -42,9 +43,16 @@ const defaultDeps = {
   calculateMetrics,
   createMetricsTaskRunner,
   sortPaths,
+  sortOutputFiles,
   getGitDiffs,
   getGitLogs,
-  packSkill,
+  // Lazy-load packSkill to defer importing the skill module chain
+  // (skillSectionGenerators, skillStyle → Handlebars), which adds ~25ms
+  // to module loading. Only used when --skill-generate is active (non-default).
+  packSkill: async (params: PackSkillParams) => {
+    const { packSkill } = await import('./skill/packSkill.js');
+    return packSkill(params);
+  },
 };
 
 export interface PackOptions {
@@ -146,8 +154,16 @@ export const pack = async (
 
     // Filter processed files to exclude suspicious ones
     const suspiciousPathSet = new Set(suspiciousFilesResults.map((r) => r.filePath));
-    const processedFiles =
+    const filteredProcessedFiles =
       suspiciousPathSet.size > 0 ? allProcessedFiles.filter((f) => !suspiciousPathSet.has(f.path)) : allProcessedFiles;
+
+    // Pre-sort processedFiles in the same order they will appear in the generated output.
+    // `generateOutput` internally calls `sortOutputFiles` as well; both share the same
+    // git-log subprocess result (cached via `fileChangeCountsCache`). The array sort itself
+    // runs twice but is negligible (~1ms for 1000 files). This ordering is required by the
+    // fast-path in `calculateMetrics`, which walks file contents through the output string
+    // in order via `extractOutputWrapper`.
+    const processedFiles = await deps.sortOutputFiles(filteredProcessedFiles, config);
 
     progressCallback('Generating output...');
 
