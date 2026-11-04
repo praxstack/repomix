@@ -29,18 +29,9 @@ export const runRemoteAction = async (
   repoUrl: string,
   cliOptions: CliOptions,
   progressCallback?: RepomixProgressCallback,
-  deps = {
-    isGitInstalled,
-    execGitShallowClone,
-    getRemoteRefs,
-    runDefaultAction,
-    downloadGitHubArchive,
-    isGitHubRepository,
-    parseGitHubRepoInfo,
-    isArchiveDownloadSupported,
-    confirmRemoteConfigTrust,
-  },
+  overrideDeps: Partial<typeof defaultDeps> = {},
 ): Promise<DefaultActionRunnerResult> => {
+  const deps = { ...defaultDeps, ...overrideDeps };
   const reportProgress = createSafeProgressCallback(progressCallback);
   const { signal } = cliOptions;
 
@@ -54,6 +45,16 @@ export const runRemoteAction = async (
     );
   }
 
+  // Validate --skill-output up front too, so an empty or whitespace-only path fails before
+  // creating a temp dir, downloading/cloning, or prompting for remote config trust
+  if (
+    cliOptions.skillGenerate !== undefined &&
+    cliOptions.skillOutput !== undefined &&
+    !cliOptions.skillOutput.trim()
+  ) {
+    throw new RepomixError('--skill-output path cannot be empty');
+  }
+
   let tempDirPath = await createTempDirectory();
   let result: DefaultActionRunnerResult;
   let downloadMethod: 'archive' | 'git' = 'git';
@@ -65,7 +66,7 @@ export const runRemoteAction = async (
 
     if (shouldTryArchive) {
       // Try GitHub archive download first
-      const spinner = new Spinner('Downloading repository archive...', cliOptions);
+      const spinner = new deps.Spinner('Downloading repository archive...', cliOptions);
 
       try {
         spinner.start();
@@ -134,7 +135,7 @@ export const runRemoteAction = async (
       downloadMethod = 'git';
     }
 
-    const trustRemoteConfig = cliOptions.remoteTrustConfig || process.env.REPOMIX_REMOTE_TRUST_CONFIG === 'true';
+    const trustRemoteConfig = cliOptions.remoteTrustConfig || deps.env.REPOMIX_REMOTE_TRUST_CONFIG === 'true';
 
     // When trusting a remote repo's config, confirm with the user first (unless
     // --force / non-interactive / already trusted). Throws if the user declines.
@@ -163,16 +164,16 @@ export const runRemoteAction = async (
       // Generate project name from URL for use in skill description
       skillProjectName = generateProjectNameFromUrl(repoUrl);
 
-      if (cliOptions.skillOutput) {
-        // Validate --skill-output is not empty or whitespace only
-        if (!cliOptions.skillOutput.trim()) {
-          throw new RepomixError('--skill-output path cannot be empty');
-        }
+      if (cliOptions.skillOutput !== undefined) {
         // Non-interactive mode: use provided path directly
-        skillDir = await resolveAndPrepareSkillDir(cliOptions.skillOutput, process.cwd(), cliOptions.force ?? false);
+        skillDir = await deps.resolveAndPrepareSkillDir(
+          cliOptions.skillOutput,
+          process.cwd(),
+          cliOptions.force ?? false,
+        );
       } else {
         // Interactive mode: prompt for skill location
-        const promptResult = await promptSkillLocation(skillName, process.cwd());
+        const promptResult = await deps.promptSkillLocation(skillName, process.cwd());
         skillDir = promptResult.skillDir;
       }
     }
@@ -218,7 +219,7 @@ export const runRemoteAction = async (
     if (!cliOptions.stdout && result.config.skillGenerate === undefined) {
       const outputFiles = result.packResult.outputFiles ?? [result.config.output.filePath];
       for (const outputFile of outputFiles) {
-        await copyOutputToCurrentDirectory(tempDirPath, process.cwd(), outputFile);
+        await deps.copyOutputToCurrentDirectory(tempDirPath, process.cwd(), outputFile);
       }
     }
 
@@ -283,6 +284,7 @@ const performGitClone = async (
     isGitInstalled: typeof isGitInstalled;
     getRemoteRefs: typeof getRemoteRefs;
     execGitShallowClone: typeof execGitShallowClone;
+    Spinner: typeof Spinner;
   },
   reportProgress: (message: string) => void = () => {},
 ): Promise<void> => {
@@ -303,7 +305,7 @@ const performGitClone = async (
   const parsedFields = parseRemoteValue(repoUrl, refs);
   warnIgnoredRemoteSubpath(parsedFields, refs);
 
-  const spinner = new Spinner('Cloning repository...', cliOptions);
+  const spinner = new deps.Spinner('Cloning repository...', cliOptions);
 
   try {
     spinner.start();
@@ -363,6 +365,10 @@ export const copyOutputToCurrentDirectory = async (
   sourceDir: string,
   targetDir: string,
   outputFileName: string,
+  deps = {
+    mkdir: fs.mkdir,
+    copyFile: fs.copyFile,
+  },
 ): Promise<void> => {
   const sourcePath = path.resolve(sourceDir, outputFileName);
   const targetPath = path.resolve(targetDir, outputFileName);
@@ -378,9 +384,9 @@ export const copyOutputToCurrentDirectory = async (
     logger.trace(`Copying output file from: ${sourcePath} to: ${targetPath}`);
 
     // Create target directory if it doesn't exist
-    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await deps.mkdir(path.dirname(targetPath), { recursive: true });
 
-    await fs.copyFile(sourcePath, targetPath);
+    await deps.copyFile(sourcePath, targetPath);
   } catch (error) {
     const nodeError = error as NodeJS.ErrnoException;
 
@@ -399,4 +405,23 @@ Please try one of the following:
 
     throw new RepomixError(`Failed to copy output file: ${(error as Error).message}`);
   }
+};
+
+// Declared after the helpers it references (copyOutputToCurrentDirectory) to avoid a TDZ error;
+// runRemoteAction only reads it at call time.
+const defaultDeps = {
+  isGitInstalled,
+  execGitShallowClone,
+  getRemoteRefs,
+  runDefaultAction,
+  downloadGitHubArchive,
+  isGitHubRepository,
+  parseGitHubRepoInfo,
+  isArchiveDownloadSupported,
+  confirmRemoteConfigTrust,
+  copyOutputToCurrentDirectory,
+  resolveAndPrepareSkillDir,
+  promptSkillLocation,
+  Spinner,
+  env: process.env,
 };
